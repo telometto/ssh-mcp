@@ -61,7 +61,9 @@ _EXTRA_SSH_ARGS_SCHEMA: dict[str, Any] = {
     "type": "array",
     "items": {"type": "string"},
     "description": (
-        "Additional ssh(1) flags passed verbatim, e.g. [\"-J\", \"jumphost\"]. "
+        "Allowlisted connection options, e.g. [\"-J\", \"jumphost\"] or "
+        "[\"-o\", \"ConnectTimeout=10\"]. Option clusters, command hooks, provider "
+        "selectors, and forwarding flags are rejected; -F only accepts /dev/null or none. "
         "Prefer the dedicated port, identity_file, and strict_host_key_checking parameters."
     ),
 }
@@ -185,7 +187,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "extra_rsync_args": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Additional rsync flags passed verbatim.",
+                    "description": (
+                        "Allowlisted rsync options such as --itemize-changes, --checksum, or --bwlimit=100. "
+                        "Transport overrides, abbreviations, clusters, and additional operands are rejected."
+                    ),
                 },
                 "port": {"type": "integer", "minimum": 1, "maximum": 65535},
                 "identity_file": {"type": "string"},
@@ -815,7 +820,7 @@ class McpServer:
         except ForwardNotFoundError as exc:
             return _tool_error(str(exc), error_type="forward_not_found")
         except RemoteFileError as exc:
-            return _tool_error(str(exc), error_type="remote_file_error")
+            return _tool_error(str(exc), error_type="remote_file_error", details=exc.details)
         except Exception as exc:  # pragma: no cover - defensive fallback
             print(traceback.format_exc(), file=sys.stderr, flush=True)
             return _tool_error(f"Internal tool error: {exc}", error_type="internal_error")
