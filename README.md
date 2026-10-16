@@ -398,7 +398,10 @@ The tmux observer is tied to the session lifecycle: stopping a session closes it
 ssh-mcp is designed for single-developer use on your own machine. It runs SSH commands as your user with your credentials.
 
 **What's protected:**
-- Port forwarding flags (`-L`, `-R`, `-D`, `-W`) and dangerous SSH options (`ProxyCommand`, `LocalCommand`, `LocalForward`, `RemoteForward`, `DynamicForward`) are blocked in `extra_ssh_args`. The only way to create forwards is through the explicit `ssh_forward` tool, which MCP clients can permission-gate.
+- `extra_ssh_args` accepts parsed connection options from an allowlist. Local command hooks (including `KnownHostsCommand`), provider/executable selectors, positional arguments, option clusters, and forwarding flags are rejected in attached and separated forms. SCP uses its own flag allowlist, so `-S`/`-D` cannot select a local program.
+- Ordinary command, session, and transfer connections set `ClearAllForwardings=yes`. SSH escape commands are disabled, and `PermitLocalCommand=no` is set before caller options. Explicit TCP forwards use `ssh_forward`, which MCP clients can permission-gate.
+- Targets accept host aliases, addresses (including IPv6), and `user@host`; leading options and URI/path syntax are rejected. Transfer operands have an end-of-options delimiter, and relative local filenames are prefixed with `./` so dashes and colons remain local filenames.
+- One-shot stdout and stderr are each capped at 1 MiB of received bytes; PTY output shares one 1 MiB cap. Exceeding a cap stops the process group and returns explicit output-limit metadata. File tools return an error with that metadata instead of processing partial content; `ssh_edit` never writes back a capped read.
 - Transcript files are created with mode `0600` and the state directory with `0700`.
 - All command arguments use `shlex.quote()` to prevent shell injection. Subprocess calls use list arguments, never `shell=True`.
 - Environment variable names are validated against `^[A-Za-z_][A-Za-z0-9_]*$`.
@@ -443,6 +446,30 @@ ssh-mcp is designed for single-developer use on your own machine. It runs SSH co
 | `ssh_stop_forward` | Stop a port forward |
 
 All session and forward tools accept standard SSH connection parameters: `port`, `identity_file`, `known_hosts_file`, `strict_host_key_checking`, and `extra_ssh_args`. So do `ssh_view`, `ssh_create`, `ssh_edit`, `ssh_grep`, and `ssh_glob`.
+
+Supported extra flags are `-4`, `-6`, `-C`, `-q`, `-v`, `-c`, `-i`, and `-J`;
+SSH also accepts `-a`, `-k`, `-x`, and `-m`. Value flags accept attached or
+separated values. Jump hosts must use `host`, `user@host`, or `[IPv6]`, with
+optional ports and comma-separated hops. `-F` only accepts `/dev/null` or
+`none`; configure other trusted SSH settings in your operator-owned SSH
+configuration. `-o Key=value` and `-o 'Key value'` accept the connection
+directives listed in `_SAFE_SSH_OPTIONS` in [ssh.py](src/ssh_mcp/ssh.py), including
+host-trust, authentication, algorithm, timeout, and keepalive settings. Unknown
+options are rejected. Use the dedicated parameters for port, identity, and
+host-trust settings.
+
+`extra_rsync_args` similarly accepts only the flags in `_SAFE_RSYNC_FLAGS` and
+`_SAFE_RSYNC_VALUE_FLAGS` in [ssh.py](src/ssh_mcp/ssh.py), including
+`--itemize-changes`, `--checksum`, `--stats`, `--bwlimit`, and include/exclude
+filters. Values are bound to their option; transport overrides, abbreviated
+options, clusters, dangling options, and additional operands are rejected.
+
+The receiver cap also applies to full-file reads, edits, directory/search
+listings, and transfer diagnostics, even with `force_read_large_files` or a
+search `head_limit`. Narrow the path or file range when a response is too large.
+Commands, writes, and transfers may already have made changes before a limit
+stops them; an output-limit error does not roll those changes back. Interactive
+sessions retain their existing unread-output cap and on-disk transcripts.
 
 ## OpenAI function registration
 
