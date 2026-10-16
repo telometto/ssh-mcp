@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import codecs
 import errno
+import heapq
+import io
+import ipaddress
 import os
 import re
 import select
+import selectors
 import shlex
 import shutil
 import signal
@@ -13,13 +17,15 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 DEFAULT_MAX_OUTPUT_CHARS = 65_536
+# Receiver-side byte budget per stream for one-shot commands and file tools.
+DEFAULT_CAPTURE_LIMIT_BYTES = 1_048_576
 # Hard cap on in-memory unread-output buffer per session.  The transcript on
 # disk always receives the full stream; only the in-memory ring is bounded.
 DEFAULT_UNREAD_BUFFER_CAP = 1_048_576  # 1 MiB
@@ -63,6 +69,10 @@ class ForwardNotFoundError(SshMcpError):
 
 class RemoteFileError(SshMcpError):
     """Raised when a remote file/directory operation cannot proceed as requested."""
+
+    def __init__(self, message: str, *, details: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details = details
 
 
 def utcnow() -> datetime:
@@ -238,53 +248,123 @@ def _env_argument(arguments: Mapping[str, Any], name: str = "env") -> dict[str, 
     return normalized
 
 
-# SSH options that execute local commands or open local resources.  These are
-# blocked in extra_ssh_args to prevent prompt-injection attacks from running
-# arbitrary commands on the *local* machine (as opposed to remote execution,
-# which is the tool's intended purpose).  The blocklist targets options whose
-# values are executed by SSH via /bin/sh -c or that open local network ports.
-_BLOCKED_SSH_OPTIONS = {
-    "proxycommand",
-    "localcommand",
-    "permitlocalcommand",
-    "localforward",
-    "remoteforward",
-    "dynamicforward",
+# Only options with data-valued connection settings belong here. Unknown
+# directives, local command hooks, config/provider selectors and forwarding
+# controls must never reach a transport through caller-supplied extras.
+_SAFE_SSH_OPTIONS = {
+    key.lower(): key for key in (
+        "AddressFamily", "BatchMode", "CertificateFile", "Ciphers", "Compression",
+        "ConnectionAttempts", "ConnectTimeout", "GlobalKnownHostsFile",
+        "HostKeyAlgorithms", "IdentitiesOnly", "IdentityFile", "IPQoS",
+        "KbdInteractiveAuthentication", "KexAlgorithms", "LogLevel", "MACs",
+        "PasswordAuthentication", "PreferredAuthentications", "PubkeyAcceptedAlgorithms",
+        "PubkeyAuthentication", "ServerAliveCountMax", "ServerAliveInterval",
+        "StrictHostKeyChecking", "TCPKeepAlive", "UserKnownHostsFile",
+    )
+}
+_SAFE_SSH_FLAGS = {"-4", "-6", "-a", "-C", "-k", "-q", "-v", "-x"}
+# scp flags have different semantics (notably -S, -D and -l). Keep a separate
+# allowlist even for the small set of extras shared by the two clients.
+_SAFE_SCP_FLAGS = {"-4", "-6", "-C", "-q", "-v"}
+_SAFE_SSH_VALUE_FLAGS = {"-c", "-F", "-i", "-J", "-m"}
+_SAFE_SCP_VALUE_FLAGS = {"-c", "-F", "-i", "-J"}
+
+# Parse rsync extras too: a dangling option can consume the enforced '-e',
+# making an earlier attached transport override effective.
+_SAFE_RSYNC_FLAGS = {
+    "--checksum", "--size-only", "--update", "--ignore-existing", "--existing",
+    "--ignore-times", "--whole-file", "--inplace", "--append", "--append-verify",
+    "--partial", "--delay-updates", "--prune-empty-dirs", "--omit-dir-times",
+    "--numeric-ids", "--safe-links", "--copy-links", "--links", "--hard-links",
+    "--itemize-changes", "--stats", "--progress", "--human-readable", "--verbose", "--quiet",
+    "-v", "-q", "-c", "-u", "-n", "-h", "-i", "-P", "-W", "-H", "-l", "-L",
+    "-k", "-K", "-x", "-t", "-O", "-p", "-E", "-o", "-g", "-D", "-A", "-X", "-S", "-I",
+}
+_SAFE_RSYNC_VALUE_FLAGS = {
+    "--bwlimit", "--timeout", "--max-size", "--min-size", "--block-size",
+    "--checksum-choice", "--compress-choice", "--compress-level", "--include", "--exclude", "--filter",
 }
 
-# rsync flags that execute local commands or override the transport.
-_BLOCKED_RSYNC_FLAGS = {"--rsh", "-e", "--rsync-path"}
+def _validate_target(target: str) -> None:
+    """Accept host aliases, addresses and user@host; never client options/URIs."""
+    user, separator, host = target.rpartition("@")
+    if not separator:
+        host = target
+    elif not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.+\-$]*", user):
+        raise ValidationError("'target' has an invalid user name.")
+    if ":" in host:
+        address = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+        try:
+            ipaddress.IPv6Address(address)
+        except ValueError as exc:
+            raise ValidationError("'target' must contain a valid IPv6 address.") from exc
+        if "%" in address and not re.fullmatch(r"[A-Za-z0-9_.-]+", address.split("%", 1)[1]):
+            raise ValidationError("'target' has an invalid IPv6 scope.")
+    elif not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", host):
+        raise ValidationError("'target' must be a host, alias, address, or user@host.")
 
-_BLOCKED_SSH_SHORT_FLAGS = {"-L", "-R", "-D", "-W"}
+
+def _validate_jump_hosts(value: str) -> None:
+    for destination in value.split(","):
+        # Jump ports use host:port or [IPv6]:port; the main target uses 'port'.
+        host = destination
+        tail = destination.rsplit("@", 1)[-1]
+        if tail.startswith("["):
+            end = destination.find("]")
+            suffix = destination[end + 1:] if end != -1 else "invalid"
+            host = destination[:end + 1]
+        else:
+            host, colon, port = destination.rpartition(":")
+            suffix = f":{port}" if colon else ""
+            if not colon:
+                host = destination
+        _validate_target(host)
+        if suffix and (not re.fullmatch(r":[0-9]+", suffix) or not 1 <= int(suffix[1:]) <= 65535):
+            raise ValidationError("'extra_ssh_args' contains an invalid jump-host port.")
 
 
-def _check_blocked_ssh_options(args: list[str], name: str) -> None:
-    """Reject SSH -o options that would execute local commands."""
-    for i, arg in enumerate(args):
-        if arg in _BLOCKED_SSH_SHORT_FLAGS:
-            raise ValidationError(
-                f"'{name}' contains blocked SSH flag '{arg}'. "
-                "Use the ssh_forward tool for port forwarding."
-            )
-        # Extract the option name from "-o Key=val" or "-oKey=val" forms.
-        raw_option: str | None = None
-        if arg == "-o" and i + 1 < len(args):
-            raw_option = args[i + 1]
-        elif arg.startswith("-o") and len(arg) > 2:
-            raw_option = arg[2:]
-        if raw_option is not None:
-            option_key = raw_option.split("=", 1)[0].strip()
-            if option_key.lower() in _BLOCKED_SSH_OPTIONS:
-                raise ValidationError(
-                    f"'{name}' contains blocked SSH option '{option_key}'. "
-                    "This option can execute local commands and is not permitted via extra_ssh_args."
-                )
+def _parse_extra_ssh_args(args: list[str], name: str, *, scp: bool = False) -> list[str]:
+    """Parse entire option tokens, including attached values, then canonicalize."""
+    flags = _SAFE_SCP_FLAGS if scp else _SAFE_SSH_FLAGS
+    value_flags = _SAFE_SCP_VALUE_FLAGS if scp else _SAFE_SSH_VALUE_FLAGS
+    normalized: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if any(ord(char) < 32 or ord(char) == 127 for char in arg):
+            raise ValidationError(f"'{name}' cannot contain control characters.")
+        if arg in flags:
+            normalized.append(arg)
+            index += 1
+            continue
+        flag = arg[:2]
+        if flag not in value_flags | {"-o"}:
+            raise ValidationError(f"'{name}' contains unsupported {'SCP' if scp else 'SSH'} flag '{arg}'.")
+        value = arg[2:]
+        if not value:
+            index += 1
+            if index == len(args):
+                raise ValidationError(f"'{name}' flag '{flag}' requires a value.")
+            value = args[index]
+        if not value or any(ord(char) < 32 and char != "\t" or ord(char) == 127 for char in value):
+            raise ValidationError(f"'{name}' flag '{flag}' has an invalid value.")
+        if flag == "-o":
+            option = re.fullmatch(r"\s*([A-Za-z][A-Za-z0-9]*)\s*(?:=\s*|\s+)(.+)", value)
+            if option is None or option[1].lower() not in _SAFE_SSH_OPTIONS:
+                raise ValidationError(f"'{name}' contains an unsupported SSH option: {value}")
+            value = f"{_SAFE_SSH_OPTIONS[option[1].lower()]}={option[2]}"
+        elif flag == "-F" and value not in {"/dev/null", "none"}:
+            raise ValidationError(f"'{name}' only permits '-F /dev/null' or '-F none'.")
+        elif flag == "-J":
+            _validate_jump_hosts(value)
+        normalized.extend([flag, value])
+        index += 1
+    return normalized
 
 
 def _extra_ssh_args_argument(arguments: Mapping[str, Any], name: str = "extra_ssh_args") -> list[str]:
     args = _string_list_argument(arguments, name, strip=False)
-    _check_blocked_ssh_options(args, name)
-    return args
+    return _parse_extra_ssh_args(args, name)
 
 
 def _exclude_argument(arguments: Mapping[str, Any], name: str = "exclude") -> list[str]:
@@ -293,15 +373,29 @@ def _exclude_argument(arguments: Mapping[str, Any], name: str = "exclude") -> li
 
 def _extra_rsync_args_argument(arguments: Mapping[str, Any], name: str = "extra_rsync_args") -> list[str]:
     args = _string_list_argument(arguments, name, strip=False)
-    for arg in args:
-        # Check both long form (--rsh) and short form (-e), and --rsh=...
-        flag = arg.split("=", 1)[0].lower()
-        if flag in _BLOCKED_RSYNC_FLAGS:
+    normalized: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in _SAFE_RSYNC_FLAGS:
+            normalized.append(arg)
+            index += 1
+            continue
+        flag, equals, value = arg.partition("=")
+        if flag not in _SAFE_RSYNC_VALUE_FLAGS:
             raise ValidationError(
-                f"'{name}' contains blocked rsync flag '{arg.split('=', 1)[0]}'. "
-                "This flag can execute local commands and is not permitted via extra_rsync_args."
+                f"'{name}' contains unsupported rsync flag '{flag}'."
             )
-    return args
+        if not equals:
+            index += 1
+            if index == len(args):
+                raise ValidationError(f"'{name}' flag '{flag}' requires a value.")
+            value = args[index]
+        # Bind values in the same token so they cannot consume the enforced
+        # transport option or be reinterpreted as flags by rsync's parser.
+        normalized.append(f"{flag}={value}")
+        index += 1
+    return normalized
 
 
 def _strict_host_key_checking_argument(
@@ -415,15 +509,19 @@ def _terminate_process_group(
     *,
     first_signal: signal.Signals = signal.SIGTERM,
     grace_period: float = 0.5,
+    include_descendants: bool = False,
 ) -> bool:
-    if process.poll() is not None:
+    if process.poll() is not None and not include_descendants:
         return False
     _signal_process_group(process, first_signal)
-    if _wait_for_exit(process, grace_period):
+    exited = _wait_for_exit(process, grace_period)
+    if exited and not include_descendants:
         return False
+    # Pipe writers may survive the group leader. Kill the remaining group even
+    # if the direct child has exited; never drain an untrusted stream to EOF.
     _signal_process_group(process, signal.SIGKILL)
     _wait_for_exit(process, 1.0)
-    return True
+    return not exited
 
 
 def _resolve_binary(configured_binary: str, *, label: str) -> str:
@@ -484,57 +582,118 @@ def _sanitize_tmux_session_name(
     return f"ssh-mcp-{session_id[:8]}"
 
 
-def _read_all_available(master_fd: int, decoder: codecs.IncrementalDecoder) -> str:
-    chunks: list[str] = []
-    while True:
-        try:
-            ready, _, _ = select.select([master_fd], [], [], 0)
-        except OSError:
-            break
-        if not ready:
-            break
-        try:
-            data = os.read(master_fd, 4096)
-        except OSError as exc:
-            if exc.errno in {errno.EIO, errno.EBADF}:
-                break
-            raise
-        if not data:
-            break
-        chunks.append(decoder.decode(data))
-    return "".join(chunks)
-
-
-def _run_without_pty(argv: list[str], *, timeout: float | None) -> dict[str, Any]:
+def _capture_output(
+    process: subprocess.Popen[Any],
+    output_fds: Mapping[int, str],
+    *,
+    timeout: float | None,
+    input_bytes: bytes | None = None,
+    translate_newlines: bool = False,
+) -> dict[str, Any]:
+    """Capture bounded raw bytes while servicing stdin and both output streams."""
     start = time.monotonic()
-    process = subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        start_new_session=True,
-    )
+    deadline = start + timeout if timeout is not None else None
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    truncated = {"stdout": False, "stderr": False}
+    limit = DEFAULT_CAPTURE_LIMIT_BYTES
     timed_out = False
-    forced_kill = False
+    input_offset = 0
+    selector = selectors.DefaultSelector()
+    completed = False
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        forced_kill = _terminate_process_group(process)
-        stdout, stderr = process.communicate()
+        for fd, stream in output_fds.items():
+            os.set_blocking(fd, False)
+            selector.register(fd, selectors.EVENT_READ, stream)
+        if input_bytes is not None and process.stdin is not None:
+            if input_bytes:
+                os.set_blocking(process.stdin.fileno(), False)
+                selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+            else:
+                process.stdin.close()
+        while selector.get_map() or process.poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                timed_out = True
+                break
+            wait = 0.1 if deadline is None else max(0.0, min(0.1, deadline - time.monotonic()))
+            for key, _ in selector.select(wait):
+                stream = key.data
+                if stream == "stdin":
+                    try:
+                        input_offset += os.write(key.fd, input_bytes[input_offset:input_offset + 4096])
+                    except BlockingIOError:
+                        continue
+                    except BrokenPipeError:
+                        input_offset = len(input_bytes)
+                    if input_offset == len(input_bytes):
+                        selector.unregister(key.fileobj)
+                        process.stdin.close()
+                    continue
+                remaining = limit - len(buffers[stream])
+                try:
+                    data = os.read(key.fd, min(65_536, remaining + 1))
+                except BlockingIOError:
+                    continue
+                except OSError as exc:
+                    if exc.errno != errno.EIO:  # PTY EOF on POSIX.
+                        raise
+                    data = b""
+                if not data:
+                    selector.unregister(key.fd)
+                    continue
+                buffers[stream].extend(data[:remaining])
+                if len(data) > remaining:
+                    truncated[stream] = True
+                    break
+            if any(truncated.values()):
+                break
+        if timed_out or any(truncated.values()):
+            _terminate_process_group(process, include_descendants=True)
+        process.wait()
+        completed = True
+    finally:
+        selector.close()
+        if not completed:
+            _terminate_process_group(process, include_descendants=True)
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
     duration_ms = int((time.monotonic() - start) * 1000)
     exit_code, term_signal = _split_return_code(process.returncode)
+    decoded = {stream: data.decode("utf-8", errors="replace") for stream, data in buffers.items()}
+    if translate_newlines:
+        decoded = {stream: data.replace("\r\n", "\n").replace("\r", "\n") for stream, data in decoded.items()}
     return {
         "exit_code": exit_code,
         "signal": term_signal,
-        "stdout": stdout or "",
-        "stderr": stderr or "",
+        **decoded,
         "timed_out": timed_out,
         "duration_ms": duration_ms,
+        "output_limit_exceeded": any(truncated.values()),
+        "output_limit_bytes": limit,
+        "stdout_truncated": truncated["stdout"],
+        "stderr_truncated": truncated["stderr"],
     }
+
+
+def _run_piped(
+    argv: list[str], *, timeout: float | None, input_text: str | None = None,
+    translate_newlines: bool = False,
+) -> dict[str, Any]:
+    input_bytes = input_text.encode("utf-8") if input_text is not None else None
+    with subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    ) as process:
+        return _capture_output(
+            process, {process.stdout.fileno(): "stdout", process.stderr.fileno(): "stderr"},
+            timeout=timeout, input_bytes=input_bytes, translate_newlines=translate_newlines,
+        )
+
+
+def _run_without_pty(argv: list[str], *, timeout: float | None) -> dict[str, Any]:
+    return _run_piped(argv, timeout=timeout, translate_newlines=True)
 
 
 def _run_without_pty_binary_safe(
@@ -551,40 +710,11 @@ def _run_without_pty_binary_safe(
     newline translation, so it's used for all ssh_view/ssh_create/ssh_edit/
     ssh_grep/ssh_glob remote script execution.
     """
-    start = time.monotonic()
-    input_bytes = input_text.encode("utf-8") if input_text is not None else None
-    process = subprocess.Popen(
-        argv,
-        stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    timed_out = False
-    forced_kill = False
-    try:
-        stdout_bytes, stderr_bytes = process.communicate(input=input_bytes, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        forced_kill = _terminate_process_group(process)
-        stdout_bytes, stderr_bytes = process.communicate()
-    duration_ms = int((time.monotonic() - start) * 1000)
-    exit_code, term_signal = _split_return_code(process.returncode)
-    return {
-        "exit_code": exit_code,
-        "signal": term_signal,
-        "stdout": (stdout_bytes or b"").decode("utf-8", errors="replace"),
-        "stderr": (stderr_bytes or b"").decode("utf-8", errors="replace"),
-        "timed_out": timed_out,
-        "duration_ms": duration_ms,
-    }
+    return _run_piped(argv, timeout=timeout, input_text=input_text)
 
 
 def _run_with_pty(argv: list[str], *, timeout: float | None) -> dict[str, Any]:
-    start = time.monotonic()
     master_fd, slave_fd = os.openpty()
-    decoder = codecs.getincrementaldecoder("utf-8")("replace")
-    output_chunks: list[str] = []
     try:
         process = subprocess.Popen(
             argv,
@@ -599,51 +729,19 @@ def _run_with_pty(argv: list[str], *, timeout: float | None) -> dict[str, Any]:
         os.close(slave_fd)
         raise
     os.close(slave_fd)
-    timed_out = False
-    forced_kill = False
-    deadline = time.monotonic() + timeout if timeout is not None else None
     try:
-        while True:
-            if deadline is not None and process.poll() is None and time.monotonic() >= deadline:
-                timed_out = True
-                forced_kill = _terminate_process_group(process)
-            wait_timeout = 0.1
-            if deadline is not None and process.poll() is None:
-                wait_timeout = max(0.0, min(0.1, deadline - time.monotonic()))
-            try:
-                ready, _, _ = select.select([master_fd], [], [], wait_timeout)
-            except OSError:
-                ready = []
-            if ready:
-                try:
-                    data = os.read(master_fd, 4096)
-                except OSError as exc:
-                    if exc.errno in {errno.EIO, errno.EBADF}:
-                        data = b""
-                    else:
-                        raise
-                if data:
-                    output_chunks.append(decoder.decode(data))
-            if process.poll() is not None:
-                output_chunks.append(_read_all_available(master_fd, decoder))
-                break
-        output_chunks.append(decoder.decode(b"", final=True))
+        return _capture_output(process, {master_fd: "stdout"}, timeout=timeout)
     finally:
         try:
             os.close(master_fd)
         except OSError:
             pass
-    duration_ms = int((time.monotonic() - start) * 1000)
-    output = "".join(part for part in output_chunks if part)
-    exit_code, term_signal = _split_return_code(process.returncode)
-    return {
-        "exit_code": exit_code,
-        "signal": term_signal,
-        "stdout": output,
-        "stderr": "",
-        "timed_out": timed_out,
-        "duration_ms": duration_ms,
-    }
+
+
+def _output_lines(output: str) -> Iterator[str]:
+    """Iterate captured lines without allocating a second list of all lines."""
+    for line in io.StringIO(output):
+        yield line[:-1] if line.endswith("\n") else line
 
 
 @dataclass(slots=True)
@@ -699,6 +797,9 @@ class ConnectionSettings:
     strict_host_key_checking: str | None = None
     extra_ssh_args: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        _validate_target(self.target)
+
     @classmethod
     def from_arguments(cls, arguments: Mapping[str, Any]) -> "ConnectionSettings":
         target = _string_argument(arguments, "target", required=True)
@@ -720,8 +821,13 @@ class ConnectionSettings:
         *,
         port_flag: str,
         tty: bool | None = None,
+        allow_forwarding: bool = False,
     ) -> list[str]:
-        argv = [program]
+        # OpenSSH uses the first value of most options. Put mandatory controls
+        # first, before extras and inherited trusted configuration.
+        argv = [program, "-o", "PermitLocalCommand=no", "-o", "EscapeChar=none"]
+        if not allow_forwarding:
+            argv.extend(["-o", "ClearAllForwardings=yes"])
         if tty is not None:
             argv.append("-tt" if tty else "-T")
         if self.port is not None:
@@ -732,7 +838,7 @@ class ConnectionSettings:
             argv.extend(["-o", f"UserKnownHostsFile={self.known_hosts_file}"])
         if self.strict_host_key_checking is not None:
             argv.extend(["-o", f"StrictHostKeyChecking={self.strict_host_key_checking}"])
-        argv.extend(self.extra_ssh_args)
+        argv.extend(_parse_extra_ssh_args(self.extra_ssh_args, "extra_ssh_args", scp=port_flag == "-P"))
         return argv
 
     def build_argv(
@@ -742,29 +848,42 @@ class ConnectionSettings:
         *,
         tty: bool,
         keepalive: bool = False,
+        forwarding_args: Sequence[str] = (),
     ) -> list[str]:
-        argv = self.build_transport_argv(ssh_binary, port_flag="-p", tty=tty)
+        argv = self.build_transport_argv(
+            ssh_binary, port_flag="-p", tty=tty, allow_forwarding=bool(forwarding_args)
+        )
         if keepalive:
             # Inject keepalive unless the caller already set them via
             # extra_ssh_args — respect explicit user overrides.
-            has_interval = any("ServerAliveInterval" in a for a in self.extra_ssh_args)
-            has_count = any("ServerAliveCountMax" in a for a in self.extra_ssh_args)
+            options = _parse_extra_ssh_args(self.extra_ssh_args, "extra_ssh_args")
+            has_interval = any(a.lower().startswith("serveraliveinterval=") for a in options)
+            has_count = any(a.lower().startswith("serveralivecountmax=") for a in options)
             if not has_interval:
                 argv.extend(["-o", "ServerAliveInterval=30"])
             if not has_count:
                 argv.extend(["-o", "ServerAliveCountMax=3"])
-        argv.append(self.target)
+        argv.extend([*forwarding_args, "--", self.target])
         if remote_command is not None:
             argv.append(remote_command)
         return argv
 
 
 def _build_remote_path(target: str, path: str) -> str:
+    user, separator, host = target.rpartition("@")
+    if not separator:
+        host = target
+    if ":" in host and not host.startswith("["):
+        target = f"{user + '@' if separator else ''}[{host}]"
     return f"{target}:{shlex.quote(path)}"
 
 
 def _expand_local_path(path: str) -> str:
     expanded = str(Path(path).expanduser())
+    # A local operand must stay local under scp/rsync's colon and option
+    # grammars, even for names such as '-e...' or 'host:file'.
+    if not os.path.isabs(expanded):
+        expanded = f"./{expanded}"
     trailing_separators = [os.sep]
     if os.altsep is not None:
         trailing_separators.append(os.altsep)
@@ -1966,7 +2085,16 @@ class SshToolService:
         ssh_binary = _resolve_ssh_binary(self._configured_ssh_binary)
         remote_command = _build_script_command(script, args)
         argv = connection.build_argv(ssh_binary, remote_command, tty=False)
-        return _run_without_pty_binary_safe(argv, timeout=timeout, input_text=input_text)
+        result = _run_without_pty_binary_safe(argv, timeout=timeout, input_text=input_text)
+        if result["output_limit_exceeded"]:
+            raise RemoteFileError(
+                f"Remote output exceeded the {result['output_limit_bytes']}-byte per-stream limit; "
+                "the operation was stopped and its response is incomplete.",
+                details={key: result[key] for key in (
+                    "output_limit_exceeded", "output_limit_bytes", "stdout_truncated", "stderr_truncated"
+                )},
+            )
+        return result
 
     def ssh_exec(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         validated = _validate_arguments(arguments)
@@ -1986,7 +2114,7 @@ class SshToolService:
         )
         argv = connection.build_argv(ssh_binary, remote_command, tty=tty)
         result = _run_with_pty(argv, timeout=timeout) if tty else _run_without_pty(argv, timeout=timeout)
-        result["ok"] = result["exit_code"] == 0 and not result["timed_out"]
+        result["ok"] = result["exit_code"] == 0 and not result["timed_out"] and not result["output_limit_exceeded"]
         result["target"] = connection.target
         result["command"] = command
         return result
@@ -2008,6 +2136,7 @@ class SshToolService:
             argv.append("-r")
         if preserve_times:
             argv.append("-p")
+        argv.append("--")
         if direction == "upload":
             normalized_sources = _normalize_local_sources(sources, recursive=recursive)
             normalized_destination = destination
@@ -2021,7 +2150,7 @@ class SshToolService:
             argv.extend(_build_remote_path(connection.target, source) for source in normalized_sources)
             argv.append(normalized_destination)
         result = _run_without_pty(argv, timeout=timeout)
-        result["ok"] = result["exit_code"] == 0 and not result["timed_out"]
+        result["ok"] = result["exit_code"] == 0 and not result["timed_out"] and not result["output_limit_exceeded"]
         result["target"] = connection.target
         result["direction"] = direction
         return result
@@ -2054,6 +2183,7 @@ class SshToolService:
             argv.extend(["--exclude", pattern])
         argv.extend(extra_rsync_args)
         argv.extend(["-e", shlex.join(ssh_transport_argv)])
+        argv.append("--")
         if direction == "upload":
             normalized_source = _normalize_local_sources([source], recursive=True)[0]
             normalized_destination = destination
@@ -2063,7 +2193,7 @@ class SshToolService:
             normalized_destination = _normalize_local_destination(destination)
             argv.extend([_build_remote_path(connection.target, normalized_source), normalized_destination])
         result = _run_without_pty(argv, timeout=timeout)
-        result["ok"] = result["exit_code"] == 0 and not result["timed_out"]
+        result["ok"] = result["exit_code"] == 0 and not result["timed_out"] and not result["output_limit_exceeded"]
         result["target"] = connection.target
         result["direction"] = direction
         return result
@@ -2261,15 +2391,12 @@ class SshToolService:
             message = result["stderr"].strip() or f"grep exited with code {exit_code}."
             raise RemoteFileError(f"Remote search under '{path}' failed: {message}")
 
-        lines = result["stdout"].split("\n")
-        if lines and lines[-1] == "":
-            lines.pop()
-
         matches: list[Any] = []
-        if output_mode == "files_with_matches":
-            matches = list(lines)
-        elif output_mode == "count":
-            for line in lines:
+        truncated = False
+        for line in _output_lines(result["stdout"]):
+            if output_mode == "files_with_matches":
+                entry = line
+            elif output_mode == "count":
                 file_path, _, count_str = line.rpartition(":")
                 if not file_path:
                     continue
@@ -2277,27 +2404,25 @@ class SshToolService:
                     count = int(count_str)
                 except ValueError:
                     continue
-                if count > 0:
-                    matches.append({"path": file_path, "count": count})
-        else:
-            for line in lines:
+                if count <= 0:
+                    continue
+                entry = {"path": file_path, "count": count}
+            else:
                 found = _GREP_MATCH_LINE_RE.match(line)
                 if found is None:
                     # Group separator lines (e.g. '--' between context blocks).
                     continue
-                entry: dict[str, Any] = {
+                entry = {
                     "path": found.group("path"),
                     "line_number": int(found.group("line")),
                     "line": found.group("text"),
                 }
                 if found.group("sep") == "-":
                     entry["is_context"] = True
-                matches.append(entry)
-
-        truncated = False
-        if head_limit is not None and len(matches) > head_limit:
-            matches = matches[:head_limit]
-            truncated = True
+            if head_limit is not None and len(matches) == head_limit:
+                truncated = True
+                break
+            matches.append(entry)
 
         return {
             "ok": True,
@@ -2329,10 +2454,14 @@ class SshToolService:
         regex = glob_to_regex(pattern)
         candidates = (
             line[2:] if line.startswith("./") else line
-            for line in result["stdout"].split("\n")
+            for line in _output_lines(result["stdout"])
             if line
         )
-        matched = sorted(candidate for candidate in candidates if regex.fullmatch(candidate))
+        matching = (candidate for candidate in candidates if regex.fullmatch(candidate))
+        matched = (
+            sorted(matching) if head_limit is None
+            else heapq.nsmallest(head_limit + 1, matching)
+        )
 
         truncated = False
         if head_limit is not None and len(matched) > head_limit:
@@ -2501,11 +2630,12 @@ class SshToolService:
             raise ValidationError("'remote_port' must be <= 65535.")
         bind_address = _string_argument(validated, "bind_address") or "127.0.0.1"
         ssh_binary = _resolve_ssh_binary(self._configured_ssh_binary)
-        argv = connection.build_argv(ssh_binary, None, tty=False, keepalive=True)
-        target_index = argv.index(connection.target)
         forward_spec = f"{bind_address}:{local_port}:{remote_host}:{remote_port}"
         flag = "-L" if direction == "local" else "-R"
-        argv[target_index:target_index] = ["-N", flag, forward_spec]
+        argv = connection.build_argv(
+            ssh_binary, None, tty=False, keepalive=True,
+            forwarding_args=["-N", flag, forward_spec],
+        )
         entry = self._forwards.start(
             target=connection.target,
             direction=direction,
@@ -2520,8 +2650,15 @@ class SshToolService:
         result = entry.summary()
         if not result["running"]:
             try:
-                _, stderr_bytes = entry.process.communicate(timeout=0.1)
-                stderr = stderr_bytes.decode("utf-8", errors="replace").strip() if stderr_bytes else ""
+                captured = _capture_output(
+                    entry.process,
+                    {entry.process.stdout.fileno(): "stdout", entry.process.stderr.fileno(): "stderr"},
+                    timeout=0.1,
+                )
+                stderr = captured["stderr"].strip()
+                result.update({key: captured[key] for key in (
+                    "output_limit_exceeded", "output_limit_bytes", "stdout_truncated", "stderr_truncated"
+                )})
             except Exception:
                 stderr = ""
             if stderr:

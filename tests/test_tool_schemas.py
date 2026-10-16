@@ -84,9 +84,12 @@ class ToolSchemaTests(unittest.TestCase):
                     settings = ConnectionSettings.from_arguments(
                         {"target": "example", "strict_host_key_checking": value})
                     self.assertEqual(settings.build_transport_argv(program, port_flag=port_flag),
-                                     [program, "-o", f"StrictHostKeyChecking={mode}"])
+                                     [program, "-o", "PermitLocalCommand=no", "-o", "EscapeChar=none",
+                                      "-o", "ClearAllForwardings=yes", "-o", f"StrictHostKeyChecking={mode}"])
         self.assertEqual(ConnectionSettings.from_arguments({"target": "example"})
-                         .build_transport_argv("ssh", port_flag="-p"), ["ssh"])
+                         .build_transport_argv("ssh", port_flag="-p"),
+                         ["ssh", "-o", "PermitLocalCommand=no", "-o", "EscapeChar=none",
+                          "-o", "ClearAllForwardings=yes"])
         for value in ("invalid", "", 0, 1, [], {}):
             with self.subTest(invalid=value), self.assertRaises(ValidationError):
                 ConnectionSettings.from_arguments({"target": "example", "strict_host_key_checking": value})
