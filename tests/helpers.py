@@ -20,7 +20,7 @@ def create_fake_ssh(directory: Path) -> Path:
         import os
         import sys
 
-        VALUE_OPTIONS = {"-p", "-i", "-o", "-F", "-L", "-R", "-D", "-W"}
+        VALUE_OPTIONS = {"-p", "-i", "-o", "-F", "-J", "-c", "-m", "-L", "-R", "-D", "-W"}
 
         def parse_arguments(argv):
             index = 0
@@ -127,7 +127,7 @@ def create_fake_scp(directory: Path) -> Path:
         import shutil
         import sys
 
-        VALUE_OPTIONS = {"-P", "-i", "-o", "-F"}
+        VALUE_OPTIONS = {"-P", "-i", "-o", "-F", "-J", "-c"}
 
         def parse_remote(spec):
             if ":" not in spec:
@@ -169,6 +169,9 @@ def create_fake_scp(directory: Path) -> Path:
         recursive = False
         while index < len(argv):
             arg = argv[index]
+            if arg == "--":
+                index += 1
+                break
             if arg == "-r":
                 recursive = True
                 index += 1
@@ -247,6 +250,9 @@ def create_fake_rsync(directory: Path) -> Path:
         index = 0
         while index < len(argv):
             arg = argv[index]
+            if arg == "--":
+                index += 1
+                break
             if arg in {"-a", "-z"}:
                 index += 1
                 continue
